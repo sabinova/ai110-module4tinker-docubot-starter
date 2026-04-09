@@ -9,6 +9,16 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had", "in", "on", "at", "to",
+    "for", "of", "with", "by", "from", "it", "its", "this", "that",
+    "and", "or", "but", "not", "no", "if", "so", "as", "can", "will",
+    "my", "your", "i", "we", "they", "he", "she", "how", "what", "when",
+    "where", "which", "who", "why",
+}
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +32,11 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Chunk documents into paragraphs for finer-grained retrieval
+        self.chunks = self.chunk_documents(self.documents)
+
+        # Build a retrieval index over chunks (implemented in Phase 1)
+        self.index = self.build_index(self.chunks)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -45,6 +58,25 @@ class DocuBot:
         return docs
 
     # -----------------------------------------------------------
+    # Chunking
+    # -----------------------------------------------------------
+
+    def chunk_documents(self, documents):
+        """
+        Split each document into paragraph-level chunks.
+        Returns a list of (filename, paragraph_text) tuples.
+        Paragraphs are separated by one or more blank lines.
+        """
+        chunks = []
+        for filename, text in documents:
+            paragraphs = text.split("\n\n")
+            for para in paragraphs:
+                para = para.strip()
+                if para:
+                    chunks.append((filename, para))
+        return chunks
+
+    # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
@@ -64,7 +96,16 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            words = text.lower().split()
+            for word in words:
+                token = word.strip(".,!?;:()[]{}\"'`#*-_/\\<>")
+                if not token:
+                    continue
+                if token not in index:
+                    index[token] = []
+                if filename not in index[token]:
+                    index[token].append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -73,16 +114,17 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
+        Return a relevance score for how well the text matches the query.
 
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        - Tokenizes both query and text on word boundaries
+        - Ignores stop words so common words don't inflate scores
+        - Counts how many meaningful query words appear in the text
         """
-        # TODO: implement scoring
-        return 0
+        text_words = set(re.findall(r"[a-z0-9]+", text.lower()))
+        query_words = re.findall(r"[a-z0-9]+", query.lower())
+        meaningful = [w for w in query_words if w not in STOP_WORDS]
+        score = sum(1 for word in meaningful if word in text_words)
+        return score
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,9 +133,51 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
+        query_words = query.lower().split()
+        candidate_files = set()
+        for word in query_words:
+            if word in self.index:
+                candidate_files.update(self.index[word])
+
         results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        for filename, text in self.chunks:
+            if filename in candidate_files:
+                score = self.score_document(query, text)
+                if score > 0:
+                    results.append((score, filename, text))
+
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [(filename, text) for _, filename, text in results[:top_k]]
+
+    # -----------------------------------------------------------
+    # Evidence Guardrail
+    # -----------------------------------------------------------
+
+    def _has_sufficient_evidence(self, query, snippets):
+        """
+        Decide whether the best retrieved snippet is strong enough to
+        justify answering.  Returns False when the evidence is too weak.
+
+        Thresholds are based on meaningful (non-stop) query words:
+        - 1 meaningful word:  score >= 1
+        - 2+ meaningful words: score >= at least a third (minimum 2)
+        - 0 meaningful words (all stop words): always refuse
+        """
+        if not snippets:
+            return False
+
+        meaningful = [w for w in re.findall(r"[a-z0-9]+", query.lower())
+                      if w not in STOP_WORDS]
+        if not meaningful:
+            return False
+
+        best_score = self.score_document(query, snippets[0][1])
+
+        if len(meaningful) == 1:
+            return best_score >= 1
+
+        min_score = max(2, len(meaningful) // 3)
+        return best_score >= min_score
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -106,7 +190,7 @@ class DocuBot:
         """
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
+        if not self._has_sufficient_evidence(query, snippets):
             return "I do not know based on these docs."
 
         formatted = []
@@ -128,7 +212,7 @@ class DocuBot:
 
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
+        if not self._has_sufficient_evidence(query, snippets):
             return "I do not know based on these docs."
 
         return self.llm_client.answer_from_snippets(query, snippets)
